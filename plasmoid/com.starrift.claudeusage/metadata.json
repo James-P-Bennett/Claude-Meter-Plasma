@@ -1,0 +1,20 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Id": "com.starrift.claudeusage",
+        "Name": "Claude Usage",
+        "Description": "Live Claude subscription usage limits (5-hour and weekly windows)",
+        "Icon": "utilities-system-monitor",
+        "Category": "System Information",
+        "License": "MIT",
+        "Version": "1.0",
+        "Authors": [
+            {
+                "Name": "James",
+                "Email": "starrift97@gmail.com"
+            }
+        ],
+        "EnabledByDefault": true
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

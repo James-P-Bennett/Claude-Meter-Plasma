@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""claude-usage — read Claude subscription usage limits.
+
+Calls the same endpoint Claude Code's `/usage` uses:
+    GET https://api.anthropic.com/api/oauth/usage
+The OAuth token is read fresh from ~/.claude/.credentials.json on every call
+(Claude Code keeps that token refreshed while you use it). This script never
+writes to or refreshes the credentials, so it can't disturb your login.
+
+NOTE: this endpoint is unofficial. If a Claude update changes its response
+shape the script degrades to status "error" with a message rather than lying.
+
+Modes (mutually compatible — JSON is always what reaches stdout):
+    --json            normalized JSON (default; consumed by the Plasma widget)
+    --line            compact one-line panel string instead of JSON
+    --notify          also evaluate thresholds and fire desktop notifications
+    --thresholds A,B  notify thresholds in percent (default 80,95)
+
+Exit status is 0 whenever a result (ok OR a structured error) was produced;
+the real state is carried in the "status" field of the payload.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+CRED_PATH = os.path.expanduser("~/.claude/.credentials.json")
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_BETA = "oauth-2025-04-20"
+STATE_DIR = os.path.expanduser("~/.cache/claude-usage")
+STATE_PATH = os.path.join(STATE_DIR, "notify-state.json")
+CACHE_PATH = os.path.join(STATE_DIR, "last.json")
+CACHE_MAX_AGE = 6 * 3600  # show last-good readings for up to 6h on failure
+
+# Weekly per-model sub-limits, in display order. Each that the endpoint
+# actually returns becomes a bar in the Weekly section; anything null/absent
+# is simply skipped, so new/retired model limits don't break us.
+WEEKLY_MODEL_SPEC = [
+    ("seven_day", "All models"),
+    ("seven_day_sonnet", "Sonnet"),
+    ("seven_day_opus", "Opus"),
+]
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def human_delta(target_iso: str | None) -> str | None:
+    """'2h 46m' style countdown until an ISO timestamp, or None if unknown."""
+    if not target_iso:
+        return None
+    try:
+        target = datetime.fromisoformat(target_iso)
+    except ValueError:
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    secs = (target - _now()).total_seconds()
+    if secs <= 0:
+        return "now"
+    mins = int(secs // 60)
+    hrs, mins = divmod(mins, 60)
+    days, hrs = divmod(hrs, 24)
+    if days:
+        return f"{days}d {hrs}h"
+    if hrs:
+        return f"{hrs}h {mins}m"
+    return f"{mins}m"
+
+
+def local_time(target_iso: str | None) -> str | None:
+    if not target_iso:
+        return None
+    try:
+        target = datetime.fromisoformat(target_iso)
+    except ValueError:
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+    return target.astimezone().strftime("%a %H:%M")
+
+
+def load_credentials() -> tuple[str | None, dict]:
+    """Return (access_token, oauth_blob). token is None if unusable/expired."""
+    try:
+        with open(CRED_PATH) as fh:
+            blob = json.load(fh).get("claudeAiOauth", {})
+    except (OSError, ValueError):
+        return None, {}
+    token = blob.get("accessToken")
+    expires_at = blob.get("expiresAt")  # ms epoch
+    if isinstance(expires_at, (int, float)) and expires_at / 1000 < time.time():
+        return None, blob  # expired — caller reports "auth"
+    return token, blob
+
+
+def fetch_usage(token: str) -> dict:
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": OAUTH_BETA,
+            "Content-Type": "application/json",
+            "User-Agent": "claude-usage-meter/1.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _bar(key: str, label: str, entry: dict) -> dict:
+    resets_at = entry.get("resets_at")
+    return {
+        "key": key,
+        "label": label,
+        "pct": round(float(entry.get("utilization") or 0.0), 1),
+        "resets_at": resets_at,
+        "resets_in": human_delta(resets_at),
+        "resets_local": local_time(resets_at),
+    }
+
+
+def normalize(raw: dict, blob: dict) -> dict:
+    # Current session (5-hour rolling window).
+    five = raw.get("five_hour")
+    session = (
+        _bar("five_hour", "Current session", five)
+        if isinstance(five, dict) and five.get("utilization") is not None
+        else None
+    )
+
+    # Weekly section: one bar per model sub-limit the endpoint returns. The
+    # section's reset clock is the all-models ("seven_day") window.
+    weekly_bars = []
+    for key, label in WEEKLY_MODEL_SPEC:
+        entry = raw.get(key)
+        if isinstance(entry, dict) and entry.get("utilization") is not None:
+            weekly_bars.append(_bar(key, label, entry))
+    weekly = None
+    if weekly_bars:
+        anchor = next((b for b in weekly_bars if b["key"] == "seven_day"), weekly_bars[0])
+        weekly = {
+            "resets_at": anchor["resets_at"],
+            "resets_in": anchor["resets_in"],
+            "resets_local": anchor["resets_local"],
+            "bars": weekly_bars,
+        }
+
+    # Pay-as-you-go credits. used_credits / monthly_limit are USD *cents*.
+    extra = raw.get("extra_usage") or {}
+    credits = None
+    if extra.get("is_enabled"):
+        credits = {
+            "enabled": True,
+            "spent_cents": extra.get("used_credits"),
+            "monthly_limit_cents": extra.get("monthly_limit"),
+            "currency": extra.get("currency") or "USD",
+        }
+
+    # Compact panel readout: 5h + weekly-all-models, the two that bite.
+    windows = []
+    if session:
+        windows.append({"key": "five_hour", "label": "5h", "pct": session["pct"],
+                        "resets_at": session["resets_at"], "resets_in": session["resets_in"]})
+    all_models = next((b for b in weekly_bars if b["key"] == "seven_day"), None)
+    if all_models:
+        windows.append({"key": "seven_day", "label": "Week", "pct": all_models["pct"],
+                        "resets_at": all_models["resets_at"], "resets_in": all_models["resets_in"]})
+
+    have_data = bool(session or weekly)
+    max_pct = max((b["pct"] for b in ([session] if session else []) + weekly_bars), default=0.0)
+    return {
+        "status": "ok" if have_data else "error",
+        "message": "" if have_data else "no known usage windows in response",
+        "plan": blob.get("subscriptionType"),
+        "tier": blob.get("rateLimitTier"),
+        "fetched_at": int(time.time()),
+        "max_pct": max_pct,
+        "windows": windows,
+        "session": session,
+        "weekly": weekly,
+        "credits": credits,
+    }
+
+
+def _err(status: str, message: str, blob: dict) -> dict:
+    return {
+        "status": status,
+        "message": message,
+        "plan": blob.get("subscriptionType"),
+        "fetched_at": int(time.time()),
+        "max_pct": 0.0,
+        "windows": [],
+        "extra_usage": None,
+    }
+
+
+def save_cache(data: dict) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(CACHE_PATH, "w") as fh:
+            json.dump(data, fh)
+    except OSError:
+        pass
+
+
+def load_cache() -> dict | None:
+    try:
+        with open(CACHE_PATH) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def with_cache_fallback(err: dict) -> dict:
+    """On any failure, keep showing the last good reading (marked stale) so the
+    meter doesn't flap to '--' on a transient 429/network blip."""
+    cached = load_cache()
+    if cached and (time.time() - cached.get("fetched_at", 0)) < CACHE_MAX_AGE:
+        stale = dict(cached)
+        stale["status"] = "stale"
+        stale["stale_reason"] = err.get("message", "")
+        return stale
+    return err
+
+
+def collect() -> dict:
+    token, blob = load_credentials()
+    if token is None:
+        if blob:
+            return with_cache_fallback(
+                _err("auth", "token expired — run `claude` once to refresh it", blob)
+            )
+        return with_cache_fallback(_err("error", "no Claude credentials found", {}))
+    try:
+        raw = fetch_usage(token)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return with_cache_fallback(
+                _err("auth", "token rejected — run `claude` once to refresh it", blob)
+            )
+        return with_cache_fallback(_err("error", f"HTTP {exc.code}", blob))
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        return with_cache_fallback(_err("error", f"{type(exc).__name__}: {exc}", blob))
+
+    data = normalize(raw, blob)
+    if data["status"] == "ok":
+        save_cache(data)
+    return data
+
+
+def to_line(data: dict) -> str:
+    if data["status"] == "auth":
+        return "Claude: auth"
+    if data["status"] not in ("ok", "stale") or not data["windows"]:
+        return "Claude: --"
+    return " · ".join(f"{w['label']} {w['pct']:.0f}%" for w in data["windows"])
+
+
+def notify(data: dict, thresholds: list[int]) -> None:
+    """Fire notify-send when a window crosses a threshold; stateful so each
+    threshold alerts at most once per window-reset cycle."""
+    if data["status"] != "ok" or not data["windows"]:
+        return
+    thresholds = sorted(thresholds)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STATE_PATH) as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        state = {}
+
+    import shutil
+    import subprocess
+
+    notify_send = shutil.which("notify-send")
+
+    for w in data["windows"]:
+        key = w["key"]
+        prev = state.get(key, {})
+        # New reset cycle -> forget previously-fired thresholds for this window.
+        if prev.get("resets_at") != w["resets_at"]:
+            prev = {"resets_at": w["resets_at"], "fired": []}
+        fired = set(prev.get("fired", []))
+        for thr in thresholds:
+            if w["pct"] >= thr and thr not in fired:
+                fired.add(thr)
+                if notify_send:
+                    critical = thr == thresholds[-1]
+                    resets = w.get("resets_in") or "?"
+                    subprocess.run(
+                        [
+                            notify_send,
+                            "-a", "Claude Usage",
+                            "-i", "dialog-warning" if critical else "dialog-information",
+                            "-u", "critical" if critical else "normal",
+                            f"Claude {w['label']} at {w['pct']:.0f}%",
+                            f"Resets in {resets}.",
+                        ],
+                        check=False,
+                    )
+        state[key] = {"resets_at": w["resets_at"], "fired": sorted(fired)}
+
+    try:
+        with open(STATE_PATH, "w") as fh:
+            json.dump(state, fh)
+    except OSError:
+        pass
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Claude subscription usage limits")
+    parser.add_argument("--json", action="store_true", help="emit normalized JSON (default)")
+    parser.add_argument("--line", action="store_true", help="emit a compact one-line string")
+    parser.add_argument("--notify", action="store_true", help="fire threshold notifications")
+    parser.add_argument("--thresholds", default="80,95", help="notify thresholds, e.g. 80,95")
+    args = parser.parse_args()
+
+    data = collect()
+
+    if args.notify:
+        try:
+            thresholds = [int(x) for x in args.thresholds.split(",") if x.strip()]
+        except ValueError:
+            thresholds = [80, 95]
+        notify(data, thresholds)
+
+    if args.line:
+        print(to_line(data))
+    else:
+        print(json.dumps(data))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
