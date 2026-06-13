@@ -1,4 +1,4 @@
-# claude-meter
+# Claude Meter (Plasma)
 
 A KDE Plasma 6 panel/tray meter for your **Claude subscription usage limits** —
 the same numbers Claude Code's `/usage` shows, always visible on your desktop.
@@ -6,6 +6,8 @@ the same numbers Claude Code's `/usage` shows, always visible on your desktop.
 The compact readout sits on your panel (e.g. `5h 23% · Week 3%`, colour-coded by
 severity). Click it for a popup with the full breakdown, and get a desktop
 notification before you hit a limit.
+
+![Meter Panel](media/Screenshot_20260613_130308.png)
 
 ## Features
 
