@@ -286,10 +286,13 @@ def notify(data: dict, thresholds: list[int]) -> None:
     for w in data["windows"]:
         key = w["key"]
         prev = state.get(key, {})
-        # New reset cycle -> forget previously-fired thresholds for this window.
-        if prev.get("resets_at") != w["resets_at"]:
-            prev = {"resets_at": w["resets_at"], "fired": []}
         fired = set(prev.get("fired", []))
+        # Detect a new cycle by the usage dropping back below the lowest
+        # threshold, not by resets_at: the 5h window is rolling, so its
+        # resets_at drifts every poll and an equality check would wipe `fired`
+        # each time and re-fire the same alert forever.
+        if w["pct"] < thresholds[0]:
+            fired = set()
         for thr in thresholds:
             if w["pct"] >= thr and thr not in fired:
                 fired.add(thr)
@@ -301,7 +304,8 @@ def notify(data: dict, thresholds: list[int]) -> None:
                             notify_send,
                             "-a", "Claude Usage",
                             "-i", "dialog-warning" if critical else "dialog-information",
-                            "-u", "critical" if critical else "normal",
+                            "-u", "normal",
+                            "-t", "4000",
                             f"Claude {w['label']} at {w['pct']:.0f}%",
                             f"Resets in {resets}.",
                         ],
