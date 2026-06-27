@@ -28,7 +28,7 @@ PlasmoidItem {
             return null
         }
         if (cfg.showSession && usage.session)
-            items.push({ "label": "5h", "pct": usage.session.pct })
+            items.push({ "label": hoursLeftLabel(usage.session.resets_at), "pct": usage.session.pct })
         var picks = [["showWeekly", "seven_day", "Week"],
                      ["showSonnet", "seven_day_sonnet", "Son"],
                      ["showOpus", "seven_day_opus", "Opus"]]
@@ -38,6 +38,20 @@ PlasmoidItem {
             if (b) items.push({ "label": picks[p][2], "pct": b.pct })
         }
         return items
+    }
+
+    // Time until the 5h session window resets, e.g. "2h23m". Falls back to
+    // "5h" if resets_at is missing or unparseable.
+    function hoursLeftLabel(resetsAt) {
+        if (!resetsAt) return "5h"
+        var reset = new Date(resetsAt).getTime()
+        if (isNaN(reset)) return "5h"
+        var mins = Math.floor((reset - Date.now()) / 60000)
+        if (mins < 0) mins = 0
+        var h = Math.floor(mins / 60)
+        var m = mins % 60
+        if (h === 0) return m + "m"
+        return h + "h" + (m < 10 ? "0" + m : m) + "m"
     }
 
     function colorFor(pct) {
