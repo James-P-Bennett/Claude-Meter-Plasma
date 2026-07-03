@@ -5,7 +5,9 @@ Calls the same endpoint Claude Code's `/usage` uses:
     GET https://api.anthropic.com/api/oauth/usage
 The OAuth token is read fresh from ~/.claude/.credentials.json on every call
 (Claude Code keeps that token refreshed while you use it). This script never
-writes to or refreshes the credentials, so it can't disturb your login.
+writes the credentials file itself; if the token has expired it shells out to
+`claude auth status` and lets Claude Code refresh its own credentials, then
+re-reads them — so it can't corrupt your login through a racing write.
 
 NOTE: this endpoint is unofficial. If a Claude update changes its response
 shape the script degrades to status "error" with a message rather than lying.
@@ -25,6 +27,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -38,6 +42,10 @@ STATE_DIR = os.path.expanduser("~/.cache/claude-usage")
 STATE_PATH = os.path.join(STATE_DIR, "notify-state.json")
 CACHE_PATH = os.path.join(STATE_DIR, "last.json")
 CACHE_MAX_AGE = 6 * 3600  # show last-good readings for up to 6h on failure
+REFRESH_STAMP = os.path.join(STATE_DIR, "refresh-attempt")
+# Widget polls every 60s; when a token can't be revived (refresh token also
+# dead → interactive login needed) this throttles the `claude` spawn.
+REFRESH_COOLDOWN = 300
 
 # Weekly per-model sub-limits, in display order. Each that the endpoint
 # actually returns becomes a bar in the Weekly section; anything null/absent
@@ -232,29 +240,80 @@ def with_cache_fallback(err: dict) -> dict:
     return err
 
 
+def _claude_bin() -> str | None:
+    """Locate the claude CLI. The Plasma executable engine runs us with a
+    minimal PATH, so fall back to the known ~/.local/bin install."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    fallback = os.path.expanduser("~/.local/bin/claude")
+    return fallback if os.access(fallback, os.X_OK) else None
+
+
+def try_claude_refresh() -> bool:
+    """Best-effort: ask Claude Code to refresh its own OAuth token by running
+    `claude auth status` (which revives an expired access token when the refresh
+    token is still valid). Claude Code owns the credentials file, so this can't
+    race a write of our own. Rate-limited so a truly dead login doesn't spawn
+    `claude` every poll. Returns True if we actually invoked it."""
+    try:
+        if time.time() - os.path.getmtime(REFRESH_STAMP) < REFRESH_COOLDOWN:
+            return False
+    except OSError:
+        pass
+    claude = _claude_bin()
+    if not claude:
+        return False
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        open(REFRESH_STAMP, "w").close()  # stamp the attempt before the call
+        subprocess.run(
+            [claude, "auth", "status"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _fetch_and_normalize(token: str, blob: dict) -> dict:
+    try:
+        raw = fetch_usage(token)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return _err("auth", "token rejected — run `claude` once to refresh it", blob)
+        return _err("error", f"HTTP {exc.code}", blob)
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        return _err("error", f"{type(exc).__name__}: {exc}", blob)
+    return normalize(raw, blob)
+
+
 def collect() -> dict:
     token, blob = load_credentials()
+    # Locally-expired token: have Claude Code refresh its own credentials, re-read.
+    if token is None and blob and try_claude_refresh():
+        token, blob = load_credentials()
     if token is None:
         if blob:
             return with_cache_fallback(
                 _err("auth", "token expired — run `claude` once to refresh it", blob)
             )
         return with_cache_fallback(_err("error", "no Claude credentials found", {}))
-    try:
-        raw = fetch_usage(token)
-    except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
-            return with_cache_fallback(
-                _err("auth", "token rejected — run `claude` once to refresh it", blob)
-            )
-        return with_cache_fallback(_err("error", f"HTTP {exc.code}", blob))
-    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
-        return with_cache_fallback(_err("error", f"{type(exc).__name__}: {exc}", blob))
 
-    data = normalize(raw, blob)
+    data = _fetch_and_normalize(token, blob)
+    # Token looked valid locally but the server rejected it: one refresh + retry.
+    if data["status"] == "auth" and try_claude_refresh():
+        token, blob = load_credentials()
+        if token:
+            data = _fetch_and_normalize(token, blob)
+
     if data["status"] == "ok":
         save_cache(data)
-    return data
+        return data
+    return with_cache_fallback(data)
 
 
 def to_line(data: dict) -> str:
