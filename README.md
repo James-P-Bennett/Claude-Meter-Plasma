@@ -3,21 +3,25 @@
 A KDE Plasma 6 panel/tray meter for your **Claude subscription usage limits** —
 the same numbers Claude Code's `/usage` shows, always visible on your desktop.
 
-The compact readout sits on your panel (e.g. `5h 23% · Week 3%`, colour-coded by
-severity). Click it for a popup with the full breakdown, and get a desktop
-notification before you hit a limit.
+The compact readout sits on your panel (e.g. `23%`, colour coded by
+severity). Click it for a popup, open the full usage window for everything, and
+get a desktop notification before you hit a limit.
 
 ![Meter Panel](media/Screenshot_20260613_130308.png)
 
 ## Features
 
-- **Live limits** from `api.anthropic.com/api/oauth/usage` — current 5-hour
-  session and weekly windows, as real utilisation percentages.
-- **Sectioned popup:** Current session · Weekly limits (All models / Sonnet /
-  Opus when active) · Usage credits (spent + monthly limit) — each with reset
-  countdowns and a coloured progress bar.
-- **Configurable panel readout:** toggle which windows show while minimised
-  (5h, weekly all-models, Sonnet, Opus).
+- **Live limits** from `api.anthropic.com/api/oauth/usage`: current 5 hour
+  session, this week, and any separate weekly limits (e.g. Fable), as real
+  utilisation percentages.
+- **Popup:** every limit with a reset countdown and a coloured progress bar.
+- **Usage window:** a normal resizable window (popup expand button, middle click
+  the panel readout, or right click > Open Usage Window) with everything: a
+  weekly summary, reset times, pace projections ("at this pace, limit in 38m"),
+  this week's usage by product (Claude Code, Chats, Cowork, Other), usage credits
+  balance and state, and monthly spend (spent, limit, auto reload).
+- **Configurable panel readout:** toggle which limits show while minimised
+  (5h, this week, separate weekly limits).
 - **Threshold notifications** at 80% / 95% (configurable, fire once per window
   per reset cycle).
 - **Refresh** every N seconds (default 60), on click, or via the popup's ↻ button.
@@ -56,7 +60,8 @@ kquitapp6 plasmashell && kstart plasmashell
 bin/claude-usage                         # Python CLI: fetch + normalize + notify
 plasmoid/com.starrift.claudeusage/       # the Plasma 6 widget (QML)
   metadata.json
-  contents/ui/main.qml                   # compact readout + popup
+  contents/ui/main.qml                   # compact readout, popup, window
+  contents/ui/UsageView.qml              # usage content shared by popup + window
   contents/ui/configGeneral.qml          # settings page
   contents/config/{main.xml,config.qml}  # config schema
 install.sh                               # symlink into the install locations
@@ -77,9 +82,8 @@ claude-usage --notify --thresholds 80,95 # also fire threshold notifications
 - **The `/api/oauth/usage` endpoint is unofficial.** A future Claude update could
   change its shape; the tool degrades to a status message rather than showing
   wrong data. See [`CLAUDE.md`](CLAUDE.md) for the response shape.
-- It only returns **utilisation percentages**. The **daily routine-run count**,
-  **credits balance**, and **credits reset date** shown on claude.ai are web-only
-  data behind your browser session and are *not* available to this tool.
+- The **daily routine run count** and **credits reset date** shown on claude.ai
+  are web only data behind your browser session and are *not* available here.
 - `extra_usage` values are in **USD cents** (`10596` = `$105.96`).
 - The OAuth token is refreshed by Claude Code itself. If it expires (you haven't
   run `claude` in a while), the widget shows an "auth" hint — run `claude` once.

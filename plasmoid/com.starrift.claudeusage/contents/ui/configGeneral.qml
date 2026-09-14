@@ -14,8 +14,7 @@ KCM.SimpleKCM {
     property alias cfg_thresholdCrit: critSpin.value
     property alias cfg_showSession: sessionCheck.checked
     property alias cfg_showWeekly: weeklyCheck.checked
-    property alias cfg_showSonnet: sonnetCheck.checked
-    property alias cfg_showOpus: opusCheck.checked
+    property alias cfg_showScoped: scopedCheck.checked
 
     Kirigami.FormLayout {
         QQC2.TextField {
@@ -43,15 +42,11 @@ KCM.SimpleKCM {
         }
         QQC2.CheckBox {
             id: weeklyCheck
-            text: i18n("Weekly — all models")
+            text: i18n("This week (all models)")
         }
         QQC2.CheckBox {
-            id: sonnetCheck
-            text: i18n("Weekly — Sonnet")
-        }
-        QQC2.CheckBox {
-            id: opusCheck
-            text: i18n("Weekly — Opus")
+            id: scopedCheck
+            text: i18n("Separate weekly limits (e.g. Fable)")
         }
 
         Item { Kirigami.FormData.isSection: true }

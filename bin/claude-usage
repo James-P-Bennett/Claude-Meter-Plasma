@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,14 +48,17 @@ REFRESH_STAMP = os.path.join(STATE_DIR, "refresh-attempt")
 # dead → interactive login needed) this throttles the `claude` spawn.
 REFRESH_COOLDOWN = 300
 
-# Weekly per-model sub-limits, in display order. Each that the endpoint
-# actually returns becomes a bar in the Weekly section; anything null/absent
-# is simply skipped, so new/retired model limits don't break us.
-WEEKLY_MODEL_SPEC = [
-    ("seven_day", "All models"),
-    ("seven_day_sonnet", "Sonnet"),
-    ("seven_day_opus", "Opus"),
+# Legacy per-window keys, used only when the response has no `limits` list.
+# Each that the endpoint actually returns becomes a bar; null/absent is skipped.
+LEGACY_LIMIT_SPEC = [
+    ("five_hour", "session", "Current session", "5h", None),
+    ("seven_day", "weekly", "This week", "Week", None),
+    ("seven_day_sonnet", "weekly", "Sonnet this week", "Sonnet", "Sonnet"),
+    ("seven_day_opus", "weekly", "Opus this week", "Opus", "Opus"),
 ]
+# Key prefix per limit group, so keys stay compatible with the legacy names
+# (a scoped weekly Fable limit becomes "seven_day_fable").
+GROUP_PREFIX = {"session": "five_hour", "weekly": "seven_day"}
 
 
 def _now() -> datetime:
@@ -124,34 +128,156 @@ def fetch_usage(token: str) -> dict:
         return json.loads(resp.read().decode())
 
 
-def _bar(key: str, label: str, entry: dict) -> dict:
-    resets_at = entry.get("resets_at")
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def _bar(key: str, label: str, short: str, group: str, pct, resets_at,
+         detail: str | None = None, severity: str | None = None,
+         active: bool | None = None) -> dict:
     return {
         "key": key,
         "label": label,
-        "pct": round(float(entry.get("utilization") or 0.0), 1),
+        "short": short,
+        "group": group,
+        "detail": detail,
+        "pct": round(float(pct or 0.0), 1),
+        "severity": severity,
+        "active": active,
         "resets_at": resets_at,
         "resets_in": human_delta(resets_at),
         "resets_local": local_time(resets_at),
     }
 
 
-def normalize(raw: dict, blob: dict) -> dict:
-    # Current session (5-hour rolling window).
-    five = raw.get("five_hour")
-    session = (
-        _bar("five_hour", "Current session", five)
-        if isinstance(five, dict) and five.get("utilization") is not None
-        else None
-    )
+def _limit_from_item(item: dict) -> dict | None:
+    """One entry of the response's generic `limits` list -> a bar."""
+    if not isinstance(item, dict) or item.get("percent") is None:
+        return None
+    kind = str(item.get("kind") or "")
+    group = str(item.get("group") or kind or "other")
+    scope = item.get("scope") or {}
+    names = [
+        (scope.get(part) or {}).get("display_name")
+        for part in ("model", "surface")
+        if isinstance(scope.get(part), dict)
+    ]
+    scope_name = " ".join(n for n in names if n)
+    prefix = GROUP_PREFIX.get(group, _slug(group))
 
-    # Weekly section: one bar per model sub-limit the endpoint returns. The
-    # section's reset clock is the all-models ("seven_day") window.
-    weekly_bars = []
-    for key, label in WEEKLY_MODEL_SPEC:
+    if kind == "session":
+        key, label, short, detail = "five_hour", "Current session", "5h", None
+    elif kind == "weekly_all":
+        key, label, short, detail = "seven_day", "This week", "Week", None
+    elif scope_name:
+        period = "this week" if group == "weekly" else group
+        key = f"{prefix}_{_slug(scope_name)}"
+        label = f"{scope_name} {period}"
+        short = scope_name
+        detail = f"Separate {group} limit for {scope_name}"
+    else:
+        key = _slug(kind) or prefix
+        label = kind.replace("_", " ").capitalize() or "Limit"
+        short, detail = label, None
+
+    return _bar(key, label, short, group, item.get("percent"), item.get("resets_at"),
+                detail=detail, severity=item.get("severity"), active=item.get("is_active"))
+
+
+def parse_limits(raw: dict) -> list[dict]:
+    items = raw.get("limits")
+    if isinstance(items, list) and items:
+        bars = [b for b in (_limit_from_item(i) for i in items) if b]
+        if bars:
+            return bars
+    bars = []
+    for key, group, label, short, scope_name in LEGACY_LIMIT_SPEC:
         entry = raw.get(key)
         if isinstance(entry, dict) and entry.get("utilization") is not None:
-            weekly_bars.append(_bar(key, label, entry))
+            detail = f"Separate weekly limit for {scope_name}" if scope_name else None
+            bars.append(_bar(key, label, short, group, entry.get("utilization"),
+                             entry.get("resets_at"), detail=detail))
+    return bars
+
+
+def _cents(value) -> int | None:
+    """Money in minor units -> cents. Accepts {amount_minor, exponent} objects
+    (the `spend` block) or bare numbers already in cents (`extra_usage`)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return round(value)
+    if isinstance(value, dict):
+        amount, exp = value.get("amount_minor"), value.get("exponent", 2)
+        if isinstance(amount, (int, float)) and isinstance(exp, int):
+            return round(amount * 10 ** (2 - exp))
+        for nested in ("amount", "value", "limit"):
+            if isinstance(value.get(nested), dict):
+                return _cents(value[nested])
+    return None
+
+
+def _flag(value) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, dict):
+        for k in ("enabled", "is_enabled"):
+            if isinstance(value.get(k), bool):
+                return value[k]
+    return None
+
+
+def parse_credits(raw: dict) -> dict | None:
+    extra = raw.get("extra_usage") if isinstance(raw.get("extra_usage"), dict) else {}
+    spend = raw.get("spend") if isinstance(raw.get("spend"), dict) else {}
+    if not extra and not spend:
+        return None
+    enabled = spend.get("enabled", extra.get("is_enabled"))
+    reason = spend.get("disabled_reason") or extra.get("disabled_reason")
+    spent = _cents(spend.get("used"))
+    if spent is None:
+        spent = _cents(extra.get("used_credits"))
+    limit = _cents(spend.get("limit"))
+    if limit is None:
+        limit = _cents(extra.get("monthly_limit"))
+    balance = _cents(spend.get("balance"))
+    if balance is None and reason == "out_of_credits":
+        balance = 0
+    used = spend.get("used") if isinstance(spend.get("used"), dict) else {}
+    return {
+        "enabled": bool(enabled),
+        "disabled_reason": reason,
+        "spent_cents": spent,
+        "monthly_limit_cents": limit,
+        "cap_cents": _cents(spend.get("cap")),
+        "balance_cents": balance,
+        "auto_reload": _flag(spend.get("auto_reload")),
+        "spend_limit_reached": bool(extra.get("spend_limit_reached")),
+        "currency": used.get("currency") or extra.get("currency") or "USD",
+    }
+
+
+def parse_breakdown(raw: dict) -> dict | None:
+    block = raw.get("seven_day_breakdown")
+    if not isinstance(block, dict) or not isinstance(block.get("rows"), list):
+        return None
+    rows = [
+        {"key": r.get("key"), "label": r.get("display_name") or r.get("key") or "?",
+         "pct": round(float(r.get("percent") or 0.0), 1)}
+        for r in block["rows"] if isinstance(r, dict)
+    ]
+    if not rows:
+        return None
+    return {"as_of": block.get("as_of"), "window_started_at": block.get("window_started_at"),
+            "rows": rows}
+
+
+def normalize(raw: dict, blob: dict) -> dict:
+    limits = parse_limits(raw)
+    session = next((b for b in limits if b["key"] == "five_hour"), None)
+
+    # Weekly section: every weekly-group limit. Its reset clock is "This week".
+    weekly_bars = [b for b in limits if b["group"] == "weekly"]
     weekly = None
     if weekly_bars:
         anchor = next((b for b in weekly_bars if b["key"] == "seven_day"), weekly_bars[0])
@@ -162,40 +288,28 @@ def normalize(raw: dict, blob: dict) -> dict:
             "bars": weekly_bars,
         }
 
-    # Pay-as-you-go credits. used_credits / monthly_limit are USD *cents*.
-    extra = raw.get("extra_usage") or {}
-    credits = None
-    if extra.get("is_enabled"):
-        credits = {
-            "enabled": True,
-            "spent_cents": extra.get("used_credits"),
-            "monthly_limit_cents": extra.get("monthly_limit"),
-            "currency": extra.get("currency") or "USD",
-        }
-
-    # Compact panel readout: 5h + weekly-all-models, the two that bite.
+    # Compact panel readout and notifications: 5h + weekly all-models.
     windows = []
-    if session:
-        windows.append({"key": "five_hour", "label": "5h", "pct": session["pct"],
-                        "resets_at": session["resets_at"], "resets_in": session["resets_in"]})
-    all_models = next((b for b in weekly_bars if b["key"] == "seven_day"), None)
-    if all_models:
-        windows.append({"key": "seven_day", "label": "Week", "pct": all_models["pct"],
-                        "resets_at": all_models["resets_at"], "resets_in": all_models["resets_in"]})
+    for key, short in (("five_hour", "5h"), ("seven_day", "Week")):
+        b = next((x for x in limits if x["key"] == key), None)
+        if b:
+            windows.append({"key": key, "label": short, "pct": b["pct"],
+                            "resets_at": b["resets_at"], "resets_in": b["resets_in"]})
 
-    have_data = bool(session or weekly)
-    max_pct = max((b["pct"] for b in ([session] if session else []) + weekly_bars), default=0.0)
+    have_data = bool(limits)
     return {
         "status": "ok" if have_data else "error",
         "message": "" if have_data else "no known usage windows in response",
         "plan": blob.get("subscriptionType"),
         "tier": blob.get("rateLimitTier"),
         "fetched_at": int(time.time()),
-        "max_pct": max_pct,
+        "max_pct": max((b["pct"] for b in limits), default=0.0),
         "windows": windows,
+        "limits": limits,
         "session": session,
         "weekly": weekly,
-        "credits": credits,
+        "credits": parse_credits(raw),
+        "breakdown": parse_breakdown(raw),
     }
 
 

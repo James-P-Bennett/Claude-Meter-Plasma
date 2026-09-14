@@ -26,11 +26,14 @@
         <entry name="showWeekly" type="Bool">
             <default>true</default>
         </entry>
-        <entry name="showSonnet" type="Bool">
+        <entry name="showScoped" type="Bool">
             <default>false</default>
         </entry>
-        <entry name="showOpus" type="Bool">
-            <default>false</default>
+        <entry name="windowWidth" type="Int">
+            <default>760</default>
+        </entry>
+        <entry name="windowHeight" type="Int">
+            <default>860</default>
         </entry>
     </group>
 </kcfg>

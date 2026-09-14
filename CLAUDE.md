@@ -13,7 +13,10 @@ Two components, one data flow:
    `~/.cache/claude-usage/last.json`; notification state in `notify-state.json`.
 2. **`plasmoid/com.starrift.claudeusage/`** — runs `claude-usage --json` on a
    QML `Timer` via the `org.kde.plasma.plasma5support` executable engine, parses
-   the JSON, and renders a compact panel readout + a popup.
+   the JSON, and renders a compact panel readout, a popup, and a standalone
+   resizable window (expand button in the popup, middle click, or the context
+   menu). Popup and window share `contents/ui/UsageView.qml` (`detailed` toggles
+   the window-only sections).
 
 The repo is the source of truth; `install.sh` symlinks both into
 `~/.local/bin` and `~/.local/share/plasma/plasmoids`. Edit files here, not in
@@ -26,19 +29,32 @@ the install locations (they're symlinks back to here).
 - **It rate-limits (HTTP 429)** under rapid calls. Do NOT hammer it while
   testing — a handful of calls in a few seconds triggers a 429 that lasts
   minutes. The widget polls every 60s by default for this reason.
-- Response shape (only utilisation %, plus codenamed null slots):
+- Response shape (as of Sept 2026; plus many codenamed null slots like
+  `nimbus_quill`, ignore those):
   ```json
-  { "five_hour": {"utilization": 23.0, "resets_at": "..."},
-    "seven_day": {"utilization": 3.0, "resets_at": "..."},
-    "seven_day_sonnet": {"utilization": 0.0, "resets_at": null},
-    "seven_day_opus": null,
-    "extra_usage": {"is_enabled": true, "used_credits": 10596.0,
-                    "monthly_limit": null, "currency": "USD"} }
+  { "five_hour": {"utilization": 27.0, "resets_at": "..."},
+    "seven_day": {"utilization": 5.0, "resets_at": "..."},
+    "extra_usage": {"is_enabled": false, "used_credits": 0.0, "monthly_limit": null,
+                    "currency": "USD", "disabled_reason": "out_of_credits"},
+    "limits": [
+      {"kind": "session", "group": "session", "percent": 27, "resets_at": "...", "scope": null},
+      {"kind": "weekly_all", "group": "weekly", "percent": 5, "resets_at": "...", "scope": null},
+      {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "resets_at": "...",
+       "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}} ],
+    "spend": {"used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+              "limit": null, "enabled": false, "disabled_reason": "out_of_credits",
+              "cap": null, "balance": null, "auto_reload": null},
+    "seven_day_breakdown": {"as_of": "...", "window_started_at": "...",
+      "rows": [{"key": "claude_code", "display_name": "Claude Code", "percent": 82}, ...]} }
   ```
-- `used_credits` / `monthly_limit` are **USD cents** (`10596` = `$105.96`).
-- The endpoint does NOT provide daily routine-run counts, credits balance, or
-  credits reset date — those are claude.ai web-only (browser session, not this
-  token). Don't fabricate them.
+- `limits[]` is the source of truth for bars (it names scoped limits like Fable);
+  the legacy `five_hour`/`seven_day_*` keys are only a fallback.
+- `extra_usage.used_credits` / `monthly_limit` are **USD cents** (`10596` =
+  `$105.96`). `spend` money is `{amount_minor, exponent}`. The non-null shapes of
+  `spend.limit`/`cap`/`balance`/`auto_reload` haven't been observed yet;
+  `_cents()`/`_flag()` guess and fall back to null.
+- The endpoint does NOT provide daily routine-run counts or the credits reset
+  date. Don't fabricate them.
 - The token is refreshed by Claude Code, not by us. On expiry/401 the CLI
   returns status `auth`; on other failures `error`; both fall back to the cache
   as status `stale` when one exists.
@@ -46,15 +62,18 @@ the install locations (they're symlinks back to here).
 ## CLI output contract (what the QML depends on)
 
 `claude-usage --json` emits: `status` (`ok`/`stale`/`auth`/`error`/`init`),
-`plan`, `tier`, `fetched_at`, `max_pct`, `windows` (compact: 5h + weekly),
-`session`, `weekly.bars[]` (keyed `seven_day`/`seven_day_sonnet`/`seven_day_opus`),
-and `credits` (`spent_cents`, `monthly_limit_cents`, `currency`). Keep this
-stable or update `contents/ui/main.qml` in lockstep.
+`plan`, `tier`, `fetched_at`, `max_pct`, `windows` (compact + notifications: 5h +
+weekly), `limits[]` (every bar: `key`, `label`, `short`, `group`, `detail`, `pct`,
+`resets_at`; keys `five_hour`, `seven_day`, `seven_day_<scope slug>`), `session`,
+`weekly.bars[]` (the weekly group of `limits`), `credits` (`enabled`,
+`disabled_reason`, `spent_cents`, `monthly_limit_cents`, `balance_cents`,
+`auto_reload`, `currency`), and `breakdown` (`rows[]` of `label`/`pct`). Keep
+this stable or update `main.qml` and `UsageView.qml` in lockstep.
 
 ## Testing
 
 - **Lint QML:** `qmllint -I /usr/lib/qt6/qml plasmoid/com.starrift.claudeusage/contents/ui/main.qml`
-  (and `configGeneral.qml`). Must exit 0.
+  (and `UsageView.qml`, `configGeneral.qml`). Must exit 0.
 - **Unit-test the parser without an API call:** load `bin/claude-usage` with
   `importlib.machinery.SourceFileLoader` (no `.py` extension) and call
   `normalize(raw, blob)` with a synthetic `raw` matching the shape above.
