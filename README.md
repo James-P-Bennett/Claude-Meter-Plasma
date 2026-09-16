@@ -22,6 +22,13 @@ get a desktop notification before you hit a limit.
   balance and state, and monthly spend (spent, limit, auto reload).
 - **Configurable panel readout:** toggle which limits show while minimised
   (5h, this week, separate weekly limits).
+- **Service health** from the public Claude status page
+  (`status.claude.com/api/v2/summary.json`, no auth): a `!` badge in the popup
+  header flashes yellow during elevated errors or degraded service and red
+  during an outage, and a solid red `!` appears next to the panel percentage for
+  an outage. Click the badge to open the status page. Severity only goes red for
+  components the widget depends on (claude.ai, Claude Code, the API); anything
+  else can only raise a yellow warning.
 - **Threshold notifications** at 80% / 95% (configurable, fire once per window
   per reset cycle).
 - **Refresh** every N seconds (default 60), on click, or via the popup's ↻ button.
@@ -75,6 +82,7 @@ install.sh                               # symlink into the install locations
 claude-usage --json                      # normalized JSON (what the widget reads)
 claude-usage --line                      # e.g.  5h 23% · Week 3%
 claude-usage --notify --thresholds 80,95 # also fire threshold notifications
+claude-usage --no-status                 # skip the status page fetch
 ```
 
 ## Caveats
@@ -85,6 +93,10 @@ claude-usage --notify --thresholds 80,95 # also fire threshold notifications
 - The **daily routine run count** and **credits reset date** shown on claude.ai
   are web only data behind your browser session and are *not* available here.
 - `extra_usage` values are in **USD cents** (`10596` = `$105.96`).
+- The status page is a **Statuspage** feed; its severity vocabulary is
+  interpreted, not official. In practice an "elevated errors" event ships as an
+  incident with impact `major` while every component still reads `operational`,
+  so incidents drive the yellow warning and component status drives red.
 - The OAuth token is refreshed by Claude Code itself. If it expires (you haven't
   run `claude` in a while), the widget shows an "auth" hint — run `claude` once.
 

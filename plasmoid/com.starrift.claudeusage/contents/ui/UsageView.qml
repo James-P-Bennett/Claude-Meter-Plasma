@@ -32,6 +32,11 @@ ColumnLayout {
         return null
     }
     readonly property var credits: usage.credits || null
+    // Claude status page (status.claude.com), folded in by the CLI as `service`.
+    readonly property var service: usage.service || null
+    readonly property string serviceSeverity: service && service.severity ? service.severity : "none"
+    readonly property bool serviceAlert: serviceSeverity !== "none"
+    readonly property bool serviceFlashing: serviceSeverity === "warn" || serviceSeverity === "outage"
     readonly property var breakdownRows: usage.breakdown && usage.breakdown.rows ? usage.breakdown.rows : []
 
     spacing: Kirigami.Units.largeSpacing
@@ -47,6 +52,50 @@ ColumnLayout {
     function statusColor() {
         if (usage.status === "auth" || usage.status === "error") return Kirigami.Theme.disabledTextColor
         return colorFor(usage.max_pct || 0)
+    }
+
+    // Yellow for elevated errors / degraded service, red for an outage of
+    // something we depend on, plain for in-progress maintenance.
+    function serviceColor() {
+        if (serviceSeverity === "outage") return Kirigami.Theme.negativeTextColor
+        if (serviceSeverity === "warn") return Kirigami.Theme.neutralTextColor
+        return Kirigami.Theme.textColor
+    }
+
+    function serviceHeadline() {
+        if (!service) return ""
+        var head = service.headline || service.description || ""
+        if (serviceSeverity === "outage") return i18n("Service outage: %1", head)
+        if (serviceSeverity === "warn") return i18n("Service issue: %1", head)
+        if (serviceSeverity === "maintenance") return i18n("Maintenance: %1", head)
+        return head
+    }
+
+    function serviceComponentText() {
+        if (!service || !service.components) return ""
+        var parts = []
+        for (var i = 0; i < service.components.length; i++) {
+            var c = service.components[i]
+            if (c.status !== "operational")
+                parts.push(c.name + ": " + String(c.status).replace(/_/g, " "))
+        }
+        return parts.join("\n")
+    }
+
+    function serviceTooltip() {
+        if (!service) return ""
+        var parts = [serviceHeadline()]
+        var comps = serviceComponentText()
+        if (comps) parts.push(comps)
+        if (service.incidents) {
+            for (var i = 0; i < service.incidents.length; i++) {
+                var inc = service.incidents[i]
+                if (inc.status) parts.push(inc.name + " (" + inc.status + ")")
+            }
+        }
+        if (service.stale) parts.push(i18n("Status page unreachable; last known state."))
+        parts.push(i18n("Click to open status.claude.com"))
+        return parts.join("\n")
     }
 
     function planLabel() {
@@ -305,6 +354,35 @@ ColumnLayout {
             PlasmaComponents.ToolTip.visible: hovered
             onClicked: view.refreshRequested()
         }
+        // Claude service health. Flashes while there's a live issue; red once
+        // something we depend on is actually out.
+        PlasmaComponents.ToolButton {
+            id: statusBadge
+            visible: view.serviceAlert
+            text: view.serviceHeadline()
+            implicitWidth: Kirigami.Units.gridUnit * 1.5
+            contentItem: PlasmaComponents.Label {
+                text: "!"
+                font.bold: true
+                font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.2
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+                color: view.serviceColor()
+            }
+            PlasmaComponents.ToolTip.text: view.serviceTooltip()
+            PlasmaComponents.ToolTip.visible: hovered
+            onClicked: Qt.openUrlExternally(view.service && view.service.url
+                                            ? view.service.url : "https://status.claude.com")
+
+            // alwaysRunToEnd so it settles back at full opacity when it stops.
+            SequentialAnimation on opacity {
+                running: statusBadge.visible && view.serviceFlashing
+                loops: Animation.Infinite
+                alwaysRunToEnd: true
+                NumberAnimation { from: 1.0; to: 0.2; duration: 600; easing.type: Easing.InOutQuad }
+                NumberAnimation { from: 0.2; to: 1.0; duration: 600; easing.type: Easing.InOutQuad }
+            }
+        }
         PlasmaComponents.ToolButton {
             visible: view.showExpand
             icon.name: "view-fullscreen"
@@ -330,6 +408,29 @@ ColumnLayout {
             if (view.stale)
                 return i18n("Showing last reading (%1).", view.usage.stale_reason || "offline")
             return view.usage.message || i18n("No data available.")
+        }
+    }
+
+    // Service-health banner: the badge is a glance, this says what's wrong.
+    ColumnLayout {
+        Layout.fillWidth: true
+        visible: view.serviceAlert
+        spacing: 0
+
+        PlasmaComponents.Label {
+            Layout.fillWidth: true
+            wrapMode: Text.WordWrap
+            font.bold: true
+            color: view.serviceColor()
+            text: view.serviceHeadline()
+        }
+        PlasmaComponents.Label {
+            Layout.fillWidth: true
+            visible: view.detailed && text.length > 0
+            wrapMode: Text.WordWrap
+            opacity: 0.7
+            font.pointSize: Kirigami.Theme.smallFont.pointSize
+            text: view.serviceComponentText()
         }
     }
 

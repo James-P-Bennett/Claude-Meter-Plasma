@@ -12,11 +12,18 @@ re-reads them — so it can't corrupt your login through a racing write.
 NOTE: this endpoint is unofficial. If a Claude update changes its response
 shape the script degrades to status "error" with a message rather than lying.
 
+It also reads the public Claude status page (no auth):
+    GET https://status.claude.com/api/v2/summary.json
+and folds it into the payload as "service", so the widget can flag elevated
+errors and outages. That fetch is cached and never allowed to fail the usage
+reading.
+
 Modes (mutually compatible — JSON is always what reaches stdout):
     --json            normalized JSON (default; consumed by the Plasma widget)
     --line            compact one-line panel string instead of JSON
     --notify          also evaluate thresholds and fire desktop notifications
     --thresholds A,B  notify thresholds in percent (default 80,95)
+    --no-status       skip the status-page fetch ("service" comes back null)
 
 Exit status is 0 whenever a result (ok OR a structured error) was produced;
 the real state is carried in the "status" field of the payload.
@@ -39,9 +46,15 @@ from datetime import datetime, timezone
 CRED_PATH = os.path.expanduser("~/.claude/.credentials.json")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
+STATUS_URL = "https://status.claude.com/api/v2/summary.json"
 STATE_DIR = os.path.expanduser("~/.cache/claude-usage")
 STATE_PATH = os.path.join(STATE_DIR, "notify-state.json")
 CACHE_PATH = os.path.join(STATE_DIR, "last.json")
+STATUS_CACHE_PATH = os.path.join(STATE_DIR, "status.json")
+# The status page is CDN-cached and cheap, but the widget can poll it from
+# several places (timer, popup open, manual refresh); serve our own copy first.
+STATUS_TTL = 60
+STATUS_MAX_AGE = 3600
 CACHE_MAX_AGE = 6 * 3600  # show last-good readings for up to 6h on failure
 REFRESH_STAMP = os.path.join(STATE_DIR, "refresh-attempt")
 # Widget polls every 60s; when a token can't be revived (refresh token also
@@ -272,6 +285,183 @@ def parse_breakdown(raw: dict) -> dict | None:
             "rows": rows}
 
 
+# ---- Claude status page -------------------------------------------------
+# Statuspage vocabulary -> our four-level severity. Only two levels are loud in
+# the widget: "warn" (yellow, elevated errors / degraded service) and "outage"
+# (red). Observed reality on this page: an "elevated errors" event ships as an
+# incident with impact "major" while every component stays "operational", so
+# incident impact is the error signal and component status is the outage signal.
+SEVERITY_ORDER = ["none", "maintenance", "warn", "outage"]
+COMPONENT_SEVERITY = {
+    "operational": "none",
+    "under_maintenance": "maintenance",
+    "degraded_performance": "warn",
+    "partial_outage": "warn",
+    "major_outage": "outage",
+}
+IMPACT_SEVERITY = {
+    "none": "none",
+    "maintenance": "maintenance",
+    "minor": "warn",
+    "major": "warn",
+    "critical": "outage",
+}
+INDICATOR_SEVERITY = dict(IMPACT_SEVERITY)
+# Components that actually affect using Claude here. Everything else (Cowork,
+# Government, Console) is still reported, but can only raise severity as far as
+# "warn" via the page-wide indicator — a Government outage shouldn't flash red.
+WATCHED_COMPONENTS = ("claude.ai", "claude code", "api.anthropic.com", "claude api")
+COMPONENT_TEXT = {
+    "degraded_performance": "degraded performance",
+    "partial_outage": "partial outage",
+    "major_outage": "major outage",
+    "under_maintenance": "under maintenance",
+}
+
+
+def _worse(a: str, b: str) -> str:
+    return a if SEVERITY_ORDER.index(a) >= SEVERITY_ORDER.index(b) else b
+
+
+def _severity(table: dict, value) -> str:
+    """Map a statuspage word to a severity. An unrecognised word that isn't
+    "operational"/"none" counts as "warn": if Anthropic adds a vocabulary word
+    we'd rather over-report than silently show all-clear through a real event."""
+    word = str(value or "none")
+    if word in table:
+        return table[word]
+    return "none" if word in ("operational", "none") else "warn"
+
+
+def _is_watched(name) -> bool:
+    low = str(name or "").lower()
+    return any(part in low for part in WATCHED_COMPONENTS)
+
+
+def fetch_status() -> dict:
+    req = urllib.request.Request(
+        STATUS_URL,
+        headers={"Accept": "application/json", "User-Agent": "claude-usage-meter/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        return json.loads(resp.read().decode())
+
+
+def parse_status(raw: dict) -> dict:
+    page = raw.get("page") if isinstance(raw.get("page"), dict) else {}
+    indicator_block = raw.get("status") if isinstance(raw.get("status"), dict) else {}
+    indicator = str(indicator_block.get("indicator") or "none")
+    description = indicator_block.get("description") or ""
+
+    components = []
+    for c in raw.get("components") or []:
+        if not isinstance(c, dict) or c.get("group"):
+            continue  # group headers carry no status of their own
+        components.append({
+            "name": c.get("name") or "?",
+            "status": c.get("status") or "unknown",
+            "watched": _is_watched(c.get("name")),
+        })
+
+    incidents = []
+    for i in raw.get("incidents") or []:
+        if not isinstance(i, dict):
+            continue
+        names = [c.get("name") for c in (i.get("components") or []) if isinstance(c, dict)]
+        incidents.append({
+            "name": i.get("name") or "Incident",
+            "status": i.get("status") or "",
+            "impact": i.get("impact") or "none",
+            "url": i.get("shortlink") or page.get("url") or STATUS_URL,
+            "started_at": i.get("started_at"),
+            "updated_at": i.get("updated_at"),
+            "components": names,
+            # No component list means we can't scope it, so treat it as ours.
+            "watched": (not names) or any(_is_watched(n) for n in names),
+        })
+
+    maintenances = [
+        {"name": m.get("name") or "Maintenance", "status": m.get("status") or "",
+         "scheduled_for": m.get("scheduled_for")}
+        for m in raw.get("scheduled_maintenances") or []
+        if isinstance(m, dict) and m.get("status") == "in_progress"
+    ]
+
+    # The page indicator covers components we don't watch, so it can only lift
+    # us to "warn"; red is reserved for something we actually depend on.
+    severity = min(_severity(INDICATOR_SEVERITY, indicator), "warn",
+                   key=SEVERITY_ORDER.index)
+    for c in components:
+        if c["watched"]:
+            severity = _worse(severity, _severity(COMPONENT_SEVERITY, c["status"]))
+    for i in incidents:
+        if i["watched"]:
+            severity = _worse(severity, _severity(IMPACT_SEVERITY, i["impact"]))
+    if maintenances:
+        severity = _worse(severity, "maintenance")
+
+    # Headline: name the live incident if there is one, else the broken
+    # components, else whatever the page says about itself.
+    hot = [i for i in incidents if i["watched"]]
+    if not hot and severity != "none":
+        hot = incidents
+    broken = [c for c in components if c["status"] != "operational"]
+    if hot:
+        headline = hot[0]["name"]
+    elif broken:
+        state = COMPONENT_TEXT.get(broken[0]["status"], broken[0]["status"].replace("_", " "))
+        # Parenthesised, not "name: state" — the widget prefixes this with
+        # "Service outage:" and two colons in one line reads badly.
+        headline = f"{', '.join(c['name'] for c in broken)} ({state})"
+    else:
+        headline = description
+
+    return {
+        "severity": severity,
+        "indicator": indicator,
+        "description": description,
+        "headline": headline,
+        "url": page.get("url") or "https://status.claude.com",
+        "updated_at": page.get("updated_at"),
+        "fetched_at": int(time.time()),
+        "stale": False,
+        "components": components,
+        "incidents": incidents,
+        "maintenances": maintenances,
+    }
+
+
+def collect_status() -> dict | None:
+    """Current service health, cached. Returns None when we've never managed to
+    read the status page — the widget then shows no badge rather than a guess."""
+    cached = None
+    try:
+        with open(STATUS_CACHE_PATH) as fh:
+            cached = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    age = time.time() - (cached or {}).get("fetched_at", 0)
+    if cached and age < STATUS_TTL:
+        return cached
+    try:
+        data = parse_status(fetch_status())
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
+            ValueError, OSError) as exc:
+        if cached and age < STATUS_MAX_AGE:
+            stale = dict(cached)
+            stale["stale"] = True
+            stale["stale_reason"] = f"{type(exc).__name__}: {exc}"
+            return stale
+        return None
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STATUS_CACHE_PATH, "w") as fh:
+            json.dump(data, fh)
+    except OSError:
+        pass
+    return data
+
+
 def normalize(raw: dict, blob: dict) -> dict:
     limits = parse_limits(raw)
     session = next((b for b in limits if b["key"] == "five_hour"), None)
@@ -310,6 +500,7 @@ def normalize(raw: dict, blob: dict) -> dict:
         "weekly": weekly,
         "credits": parse_credits(raw),
         "breakdown": parse_breakdown(raw),
+        "service": None,
     }
 
 
@@ -322,6 +513,7 @@ def _err(status: str, message: str, blob: dict) -> dict:
         "max_pct": 0.0,
         "windows": [],
         "extra_usage": None,
+        "service": None,
     }
 
 
@@ -405,7 +597,15 @@ def _fetch_and_normalize(token: str, blob: dict) -> dict:
     return normalize(raw, blob)
 
 
-def collect() -> dict:
+def collect(with_status: bool = True) -> dict:
+    data = _collect_usage()
+    # Service health is independent of our login, so it's attached after the
+    # cache fallback: even an "auth"/"stale" payload carries a live status read.
+    data["service"] = collect_status() if with_status else None
+    return data
+
+
+def _collect_usage() -> dict:
     token, blob = load_credentials()
     # Locally-expired token: have Claude Code refresh its own credentials, re-read.
     if token is None and blob and try_claude_refresh():
@@ -499,9 +699,11 @@ def main() -> int:
     parser.add_argument("--line", action="store_true", help="emit a compact one-line string")
     parser.add_argument("--notify", action="store_true", help="fire threshold notifications")
     parser.add_argument("--thresholds", default="80,95", help="notify thresholds, e.g. 80,95")
+    parser.add_argument("--no-status", action="store_true",
+                        help="skip the Claude status page fetch")
     args = parser.parse_args()
 
-    data = collect()
+    data = collect(with_status=not args.no_status)
 
     if args.notify:
         try:

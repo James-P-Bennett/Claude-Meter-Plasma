@@ -15,6 +15,7 @@ KCM.SimpleKCM {
     property alias cfg_showSession: sessionCheck.checked
     property alias cfg_showWeekly: weeklyCheck.checked
     property alias cfg_showScoped: scopedCheck.checked
+    property alias cfg_watchStatus: statusCheck.checked
 
     Kirigami.FormLayout {
         QQC2.TextField {
@@ -47,6 +48,14 @@ KCM.SimpleKCM {
         QQC2.CheckBox {
             id: scopedCheck
             text: i18n("Separate weekly limits (e.g. Fable)")
+        }
+
+        Item { Kirigami.FormData.isSection: true }
+
+        QQC2.CheckBox {
+            id: statusCheck
+            Kirigami.FormData.label: i18n("Claude status:")
+            text: i18n("Warn about outages and elevated errors")
         }
 
         Item { Kirigami.FormData.isSection: true }

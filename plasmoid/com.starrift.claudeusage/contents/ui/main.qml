@@ -20,6 +20,13 @@ PlasmoidItem {
     readonly property bool hasData: (usage.status === "ok" || usage.status === "stale")
                                     && usage.windows && usage.windows.length > 0
 
+    // Claude status page health, from the CLI's `service` block.
+    readonly property var service: usage.service || null
+    readonly property string serviceSeverity: service && service.severity ? service.severity : "none"
+    // The panel only speaks up for a real outage — a solid red "!" beside the
+    // percentages. Lesser issues stay in the popup badge.
+    readonly property bool serviceOutage: serviceSeverity === "outage"
+
     // Which readouts the compact (panel) view shows, per the config toggles.
     readonly property var compactItems: {
         if (!hasData) return []
@@ -52,6 +59,7 @@ PlasmoidItem {
 
     function command() {
         var c = Plasmoid.configuration.scriptPath + " --json"
+        if (!Plasmoid.configuration.watchStatus) c += " --no-status"
         if (Plasmoid.configuration.notify) {
             c += " --notify --thresholds " + Plasmoid.configuration.thresholdWarn
                  + "," + Plasmoid.configuration.thresholdCrit
@@ -79,6 +87,9 @@ PlasmoidItem {
 
     toolTipMainText: i18n("Claude usage")
     toolTipSubText: {
+        var head = ""
+        if (serviceSeverity !== "none" && service)
+            head = (service.headline || "") + "\n"
         if (hasData) {
             var parts = []
             for (var i = 0; i < usage.windows.length; i++) {
@@ -89,11 +100,11 @@ PlasmoidItem {
             }
             var s = parts.join("\n")
             if (usage.status === "stale") s += "\n" + i18n("(showing last reading: %1)", usage.stale_reason || "offline")
-            return s
+            return head + s
         }
-        if (usage.status === "auth") return usage.message || i18n("Sign-in needed")
-        if (usage.status === "init") return i18n("Loading…")
-        return usage.message || i18n("No data")
+        if (usage.status === "auth") return head + (usage.message || i18n("Sign-in needed"))
+        if (usage.status === "init") return head + i18n("Loading…")
+        return head + (usage.message || i18n("No data"))
     }
 
     preferredRepresentation: compactRepresentation
@@ -145,6 +156,7 @@ PlasmoidItem {
         target: Plasmoid.configuration
         function onNotifyChanged() { root.refresh() }
         function onScriptPathChanged() { root.refresh() }
+        function onWatchStatusChanged() { root.refresh() }
     }
 
     // ---- Standalone window -----------------------------------------------
@@ -214,13 +226,26 @@ PlasmoidItem {
             root.expanded = !root.expanded
         }
 
-        Layout.minimumWidth: contentLoader.implicitWidth + Kirigami.Units.smallSpacing * 2
+        Layout.minimumWidth: compactRow.implicitWidth + Kirigami.Units.smallSpacing * 2
         Layout.preferredWidth: Layout.minimumWidth
 
-        Loader {
-            id: contentLoader
+        RowLayout {
+            id: compactRow
             anchors.centerIn: parent
-            sourceComponent: (root.hasData && root.compactItems.length > 0) ? readout : placeholder
+            spacing: Kirigami.Units.smallSpacing
+
+            Loader {
+                id: contentLoader
+                sourceComponent: (root.hasData && root.compactItems.length > 0) ? readout : placeholder
+            }
+
+            // Solid (not flashing) red "!" — the flashing one is the popup badge.
+            PlasmaComponents.Label {
+                visible: root.serviceOutage
+                text: "!"
+                font.bold: true
+                color: Kirigami.Theme.negativeTextColor
+            }
         }
 
         Component {

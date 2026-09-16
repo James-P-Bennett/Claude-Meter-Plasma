@@ -24,6 +24,16 @@ the install locations (they're symlinks back to here).
 
 ## Critical facts (verify before trusting)
 
+- **Service health comes from a second, unauthenticated source:**
+  `GET https://status.claude.com/api/v2/summary.json` (a Statuspage feed;
+  `status.anthropic.com` 301s to it). Cached in `~/.cache/claude-usage/status.json`
+  for `STATUS_TTL` (60s) and reused for up to an hour when unreachable. Severity
+  is derived, not given: component `major_outage` or incident impact `critical`
+  → `outage` (red); `degraded_performance`/`partial_outage` or incident impact
+  `minor`/`major` → `warn` (yellow); page-wide `indicator` is capped at `warn`
+  because it also covers components we don't watch (`WATCHED_COMPONENTS`).
+  Real incidents ("elevated errors") carry impact `major` while every component
+  stays `operational`, so don't key outage detection off component status alone.
 - **The `/api/oauth/usage` endpoint is unofficial.** Required headers:
   `Authorization: Bearer <token>` and `anthropic-beta: oauth-2025-04-20`.
 - **It rate-limits (HTTP 429)** under rapid calls. Do NOT hammer it while
@@ -67,7 +77,13 @@ weekly), `limits[]` (every bar: `key`, `label`, `short`, `group`, `detail`, `pct
 `resets_at`; keys `five_hour`, `seven_day`, `seven_day_<scope slug>`), `session`,
 `weekly.bars[]` (the weekly group of `limits`), `credits` (`enabled`,
 `disabled_reason`, `spent_cents`, `monthly_limit_cents`, `balance_cents`,
-`auto_reload`, `currency`), and `breakdown` (`rows[]` of `label`/`pct`). Keep
+`auto_reload`, `currency`), `breakdown` (`rows[]` of `label`/`pct`), and
+`service` (`severity` one of `none`/`maintenance`/`warn`/`outage`, plus
+`indicator`, `description`, `headline`, `url`, `updated_at`, `stale`,
+`components[]`, `incidents[]`, `maintenances[]`; null with `--no-status` or when
+the status page has never been reachable). `service` is attached after the cache
+fallback, so an `auth`/`stale`/`error` payload still carries live service health
+— which is the point, since an outage is when the usage call itself fails. Keep
 this stable or update `main.qml` and `UsageView.qml` in lockstep.
 
 ## Testing
@@ -80,6 +96,13 @@ this stable or update `main.qml` and `UsageView.qml` in lockstep.
 - **Apply QML changes to the running widget:** Plasma caches plasmoid QML, so
   `kquitapp6 plasmashell && kstart plasmashell` is required after editing QML.
   Config-only changes (the `cfg_*` settings) apply live, no restart.
+- **Verifying UI without clicking the panel:** `qml6` a harness that imports a
+  copy of `UsageView.qml` with a synthetic `usage` object, and have it call
+  `grabToImage(...).saveToFile(path)` — `spectacle` only grabs the whole 3x4K
+  desktop, and `spectacle -a` doesn't honour the active window here. Bare `qml6`
+  has no Plasma palette, so `negativeTextColor` renders green there; check
+  colours on the real panel. To see the real popup, temporarily set
+  `root.expanded = true` from a `Timer`, restart plasmashell, screenshot, revert.
 - Listing/adding/removing widgets programmatically:
   `qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript '<js>'`
   using `panels()[i].widgets()` and `addWidget`/`.remove()`. After a restart the
