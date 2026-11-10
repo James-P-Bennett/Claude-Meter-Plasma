@@ -32,6 +32,7 @@ the real state is carried in the "status" field of the payload.
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import re
@@ -44,6 +45,9 @@ import urllib.request
 from datetime import datetime, timezone
 
 CRED_PATH = os.path.expanduser("~/.claude/.credentials.json")
+# Claude Code caches its /api/oauth/profile read here (`oauthAccount`), which
+# carries the subscription start date we derive the billing period from.
+CLAUDE_CONFIG_PATH = os.path.expanduser("~/.claude.json")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
 STATUS_URL = "https://status.claude.com/api/v2/summary.json"
@@ -283,6 +287,48 @@ def parse_breakdown(raw: dict) -> dict | None:
         return None
     return {"as_of": block.get("as_of"), "window_started_at": block.get("window_started_at"),
             "rows": rows}
+
+
+# ---- Subscription billing period ----------------------------------------
+# No endpoint reports when the current subscription period ends. Stripe bills
+# monthly on the anniversary of the subscription start (clamped to the last
+# day of shorter months), so the period is derived from that anchor. It's an
+# estimate: an annual plan or a re-anchored subscription would be wrong.
+
+def _add_months(anchor: datetime, months: int) -> datetime:
+    years, month0 = divmod(anchor.month - 1 + months, 12)
+    year, month = anchor.year + years, month0 + 1
+    day = min(anchor.day, calendar.monthrange(year, month)[1])
+    return anchor.replace(year=year, month=month, day=day)
+
+
+def billing_period(anchor: datetime, now: datetime) -> tuple[datetime, datetime]:
+    """(start, end) of the monthly billing period containing `now`."""
+    n = (now.year - anchor.year) * 12 + (now.month - anchor.month)
+    while n > 0 and _add_months(anchor, n) > now:
+        n -= 1
+    while _add_months(anchor, n + 1) <= now:
+        n += 1
+    return _add_months(anchor, n), _add_months(anchor, n + 1)
+
+
+def collect_subscription() -> dict | None:
+    try:
+        with open(CLAUDE_CONFIG_PATH) as fh:
+            account = json.load(fh).get("oauthAccount") or {}
+        anchor = datetime.fromisoformat(str(account["subscriptionCreatedAt"]).replace("Z", "+00:00"))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    start, end = billing_period(anchor, _now())
+    return {
+        "created_at": anchor.isoformat(),
+        "billing_type": account.get("billingType"),
+        "period_start": start.isoformat(),
+        "period_end": end.isoformat(),
+        "ends_in": human_delta(end.isoformat()),
+    }
 
 
 # ---- Claude status page -------------------------------------------------
@@ -599,9 +645,11 @@ def _fetch_and_normalize(token: str, blob: dict) -> dict:
 
 def collect(with_status: bool = True) -> dict:
     data = _collect_usage()
-    # Service health is independent of our login, so it's attached after the
-    # cache fallback: even an "auth"/"stale" payload carries a live status read.
+    # Service health and the billing period don't depend on the usage call, so
+    # they're attached after the cache fallback: even an "auth"/"stale" payload
+    # carries a live status read and a current period.
     data["service"] = collect_status() if with_status else None
+    data["subscription"] = collect_subscription()
     return data
 
 

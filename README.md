@@ -20,6 +20,10 @@ get a desktop notification before you hit a limit.
   weekly summary, reset times, pace projections ("at this pace, limit in 38m"),
   this week's usage by product (Claude Code, Chats, Cowork, Other), usage credits
   balance and state, and monthly spend (spent, limit, auto reload).
+- **Subscription period bar** in the popup and window: time left in the
+  current billing period. No endpoint reports this, so it's estimated from the
+  monthly anniversary of your subscription start date (read from Claude Code's
+  cached profile in `~/.claude.json`). Annual plans will show the wrong date.
 - **Configurable panel readout:** toggle which limits show while minimised
   (5h, this week, separate weekly limits).
 - **Service health** from the public Claude status page

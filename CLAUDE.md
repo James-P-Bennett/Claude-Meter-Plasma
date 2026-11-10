@@ -65,6 +65,21 @@ the install locations (they're symlinks back to here).
   `_cents()`/`_flag()` guess and fall back to null.
 - The endpoint does NOT provide daily routine-run counts or the credits reset
   date. Don't fabricate them.
+- **No endpoint gives the subscription end/renewal date.** The `subscription`
+  block is an estimate: monthly anniversary of `oauthAccount.subscriptionCreatedAt`
+  from `~/.claude.json` (Claude Code's cached `/api/oauth/profile` read; no API
+  call of ours), clamped to month end like Stripe. Wrong for annual plans.
+- **Free limit resets (`cedar_ember`) are deliberately not implemented.**
+  `GET /api/oauth/usage?cedar_ember=1` fills a `cedar_ember` block (`grants[]`
+  with `resets_left`, `resets_total`, `ends_at`, `type`, `usable_now`), but the
+  server gates it on client surface via User-Agent: ours gets
+  `eligible: false, ineligible_reason: "surface"`. Unlocking it means spoofing
+  Claude Code's `claude-cli/<ver>` User-Agent, which the owner declined
+  (account risk). A browser extension polling claude.ai's internal API was also
+  declined: nothing that risks the ToS. Claude Code exposes no other route
+  (`claude -p "/usage"` and the statusline input omit grants;
+  `unusedLimitResetStatusCache` in `~/.claude.json` is a bare flag and unset).
+  Don't add it unless an official, non-spoofed source appears.
 - The token is refreshed by Claude Code, not by us. On expiry/401 the CLI
   returns status `auth`; on other failures `error`; both fall back to the cache
   as status `stale` when one exists.
@@ -81,9 +96,12 @@ weekly), `limits[]` (every bar: `key`, `label`, `short`, `group`, `detail`, `pct
 `service` (`severity` one of `none`/`maintenance`/`warn`/`outage`, plus
 `indicator`, `description`, `headline`, `url`, `updated_at`, `stale`,
 `components[]`, `incidents[]`, `maintenances[]`; null with `--no-status` or when
-the status page has never been reachable). `service` is attached after the cache
-fallback, so an `auth`/`stale`/`error` payload still carries live service health
-— which is the point, since an outage is when the usage call itself fails. Keep
+the status page has never been reachable), and `subscription` (`created_at`,
+`billing_type`, `period_start`, `period_end`, `ends_in`; null when Claude Code
+hasn't cached `subscriptionCreatedAt`). `service` and `subscription` are attached
+after the cache fallback, so an `auth`/`stale`/`error` payload still carries live
+service health and the current period — which is the point, since an outage is
+when the usage call itself fails. Keep
 this stable or update `main.qml` and `UsageView.qml` in lockstep.
 
 ## Testing

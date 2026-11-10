@@ -38,6 +38,11 @@ ColumnLayout {
     readonly property bool serviceAlert: serviceSeverity !== "none"
     readonly property bool serviceFlashing: serviceSeverity === "warn" || serviceSeverity === "outage"
     readonly property var breakdownRows: usage.breakdown && usage.breakdown.rows ? usage.breakdown.rows : []
+    // Current billing period, estimated by the CLI from the subscription start.
+    readonly property var subscription: usage.subscription || null
+    readonly property real periodStartMs: subscription ? new Date(subscription.period_start).getTime() : NaN
+    readonly property real periodEndMs: subscription ? new Date(subscription.period_end).getTime() : NaN
+    readonly property bool hasPeriod: periodEndMs > periodStartMs
 
     spacing: Kirigami.Units.largeSpacing
 
@@ -193,6 +198,24 @@ ColumnLayout {
             lead = day <= 1 ? i18n("Fresh week.") : i18n("Day %1 of 7.", Math.min(7, day))
         }
         return (lead ? lead + " " : "") + i18n("%1% of your weekly limit used.", pct)
+    }
+
+    function periodPct() {
+        return 100 * (now - periodStartMs) / (periodEndMs - periodStartMs)
+    }
+
+    function periodLeftText() {
+        var ms = periodEndMs - now
+        return ms <= 0 ? i18n("renewing") : i18n("%1 left", duration(ms))
+    }
+
+    function periodDetail() {
+        var d = new Date(periodEndMs)
+        if (!detailed)
+            return i18n("period ends %1", d.toLocaleDateString(Qt.locale(), "MMM d"))
+        var when = d.toLocaleDateString(Qt.locale(), Locale.LongFormat) + " "
+                   + d.toLocaleTimeString(Qt.locale(), Locale.ShortFormat)
+        return i18n("Period ends %1 · estimated from your billing date", when)
     }
 
     function money(cents) {
@@ -467,6 +490,22 @@ ColumnLayout {
                 pctColor: view.colorFor(modelData.pct)
             }
         }
+    }
+
+    // ---- Subscription period ---------------------------------------------
+    // Local data (Claude Code's cached profile), so it shows even when the
+    // usage call itself is failing.
+    Kirigami.Separator {
+        Layout.fillWidth: true
+        visible: view.hasPeriod
+    }
+
+    MeterRow {
+        visible: view.hasPeriod
+        title: i18n("Subscription")
+        detail: view.hasPeriod ? view.periodDetail() : ""
+        pct: view.hasPeriod ? view.periodPct() : 0
+        pctText: view.hasPeriod ? view.periodLeftText() : ""
     }
 
     // ---- Usage by product (window only) ----------------------------------
